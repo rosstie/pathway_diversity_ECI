@@ -1,5 +1,7 @@
 import itertools
 import csv
+import numpy as np
+from scipy.sparse import lil_matrix
 
 import cProfile
 import pstats
@@ -31,7 +33,7 @@ def read_proximities_and_commodity_codes(file_path, threshold):
                 commodity_codes.update([commoditycode_1, commoditycode_2])
     return proximity_dict, sorted(commodity_codes)
 
-def generate_states(commodity_codes,max_codes,memo={}):
+def generate_states(commodity_codes, max_codes, memo={}):
     """
     Generate all possible states given a list of commodity codes and a maximum number of codes. 
     Maximum number of codes is used to limit the state space in line with historical data of the amount of products 
@@ -46,27 +48,22 @@ def generate_states(commodity_codes,max_codes,memo={}):
         list: A list of all possible states.
 
     """
-    
-    # if tuple(commodity_codes) in memo:
-        # return memo[tuple(commodity_codes)]
-    
     if (tuple(commodity_codes), max_codes) in memo:
         return memo[(tuple(commodity_codes), max_codes)]
     
     states = []
     n = len(commodity_codes)
-    for i in range(1, n + 1):
+    for i in range(1, min(max_codes, n) + 1):
         for comb in itertools.combinations(commodity_codes, i):
             states.append(comb)
     
-    memo[tuple(commodity_codes)] = states
+    memo[(tuple(commodity_codes), max_codes)] = states
     return states
 
 def calculate_transition_probability(state1, state2, proximity_dict, memo):
     """
-    Calculates the transition probability between two states based on product of sum of proxities between
-    state 1 and state 2. Captures necessity to consider all elements in state 2 when 
-    calculating transition probability as state 2 requires all commodities to be present.
+    Calculates the transition probability between two states based on the sum of proximities between
+    elements in state1 and state2. Assumes that state2 requires all elements to be present.
 
     Args:
         state1 (list): The first state.
@@ -84,41 +81,38 @@ def calculate_transition_probability(state1, state2, proximity_dict, memo):
     if not state1 or not state2:
         return 0
     
-    prob = 1
-    for elem2 in state2:
-        if elem2 not in state1:
-            transition_prob = 0
-            for elem1 in state1:
-                transition_prob += proximity_dict.get((elem1, elem2), 0)
-            prob *= transition_prob
+    prob = 0
+    for elem1 in state1:
+        for elem2 in state2:
+            prob += proximity_dict.get((elem1, elem2), 0)
     
     memo[key] = prob
     return prob
 
-def create_transition_matrix(states, proximity_dict):
+def create_transition_matrix(states, proximity_dict, max_code_additions):
     """
-    Creates a transition matrix based on the given states and proximity dictionary.
+    Creates a sparse transition matrix based on the given states and proximity dictionary.
 
     Args:
         states (list): A list of states.
         proximity_dict (dict): A dictionary representing the proximity between states.
 
     Returns:
-        tuple: A tuple containing the transition matrix and a memoization dictionary.
+        tuple: A tuple containing the sparse transition matrix and a memoization dictionary.
     """
     memo = {}
     n = len(states)
-    transition_matrix = [[0]*n for _ in range(n)]
+    transition_matrix = lil_matrix((n, n))
     for i, state1 in enumerate(states):
         for j, state2 in enumerate(states):
-            if i != j:
-                transition_matrix[i][j] = calculate_transition_probability(state1, state2, proximity_dict, memo)
+            if i != j and len(set(state2) - set(state1)) <= max_code_additions:
+                transition_matrix[i, j] = calculate_transition_probability(state1, state2, proximity_dict, memo)
     
     # Normalize each row
+    row_sums = transition_matrix.sum(axis=1)
     for i in range(n):
-        row_sum = sum(transition_matrix[i])
-        if row_sum > 0:
-            transition_matrix[i] = [x / row_sum for x in transition_matrix[i]]
+        if row_sums[i] > 0:
+            transition_matrix[i, :] /= row_sums[i]
     
     return transition_matrix, memo
 
@@ -137,8 +131,6 @@ def create_state_mapping(states):
         state_mapping[i] = state
     return state_mapping
 
-import numpy as np
-
 def simulate_markov_process(transition_matrix, initial_vector, max_additions, steps):
     current_vector = np.array(initial_vector)
     for _ in range(steps):
@@ -155,7 +147,7 @@ def simulate_markov_process(transition_matrix, initial_vector, max_additions, st
             next_vector = constrained_next_vector
         
         current_vector = next_vector / np.sum(next_vector)  # Ensure normalization
-        print('vector at step',_,current_vector)
+        # print('vector at step', _, current_vector)
     
     return current_vector
 
@@ -163,7 +155,7 @@ def main():
     # Example usage
     # Pruning params to limit state space and transition matrix size 
     threshold = 0.1 # minimum proximity threshold to consider - Historical Data
-    max_codes = 3 # maximum number of commodity codes to consider in a given state - Historcal Data  
+    max_code_additions = 3 # maximum number of commodity codes to consider in a given state - Historcal Data  
 
     # Variables for calculating transition matrix
     file_path = '../data/eci_test.csv'
@@ -177,7 +169,7 @@ def main():
         print(row)
 
     # print the dimensions of the transition matrix to make sure it matches anticipated dimensions
-    print('dimensions of transition matrix:',len(transition_matrix),len(transition_matrix[0])) 
+    print('dimensions of transition matrix:',transition_matrix.shape[0],transition_matrix.shape[1]) 
     print(len(commodity_codes)**2) # to check if the dimensions of the transition matrix match the number of possible states
 
     # Print the state mapping
@@ -188,7 +180,7 @@ def main():
     ################# Example usage of simulate_markov_process ################# 
     # Calculation params 
     steps = 10
-    max_additions = len(commodity_codes)
+    additions_considered = len(commodity_codes)
 
     # Example initial vector
     initial_vector = [1 if state == ('0101','0103','0104') else 0 for state in states]
@@ -217,45 +209,27 @@ if __name__ == "__main__":
     stats = pstats.Stats(profiler)
     stats.print_stats()
 
-'''
-# states generator no memoisation
-def generate_states(commodity_codes):
-    states = []
-    n = len(commodity_codes)
-    for i in range(1, n + 1):
-        for comb in itertools.combinations(commodity_codes, i):
-            states.append(comb)
-    print('states',states)
-    return states
-'''
-'''
-def calculate_transition_probability(state1, state2, proximity_dict, memo):
-    """
-    Calculates the transition probability as sum of proximities between two states.
+# Example usage
+# Pruning params to limit state space and transition matrix size 
+threshold = 0.1  # minimum proximity threshold to consider - Historical Data
+max_codes = 3  # maximum number of commodity codes to consider in a given state - Historical Data  
+max_code_additions = 10  # the maximum number of products that can be added over a time step - Historical Data
 
-    Args:
-        state1 (list): The first state.
-        state2 (list): The second state.
-        proximity_dict (dict): A dictionary containing the proximity values between elements.
-        memo (dict): A memoization dictionary to store previously calculated probabilities.
+# Variables for calculating transition matrix
+file_path = '../data/eci_test.csv'
+proximity_dict, commodity_codes = read_proximities_and_commodity_codes(file_path, threshold)
+states = generate_states(commodity_codes, max_codes)
+transition_matrix, memo = create_transition_matrix(states, proximity_dict)
+state_mapping = create_state_mapping(states)
 
-    Returns:
-        float: The transition probability between state1 and state2.
-    """
-    key = (state1, state2)
-    if key in memo:
-        return memo[key]
-    
-    if not state1 or not state2:
-        return 0
-    
-    prob = 0
-    for elem1 in state1: # loop through all elements in state1
-        for elem2 in state2: # loop through all elements in state2
-            if elem1 != elem2: # if elements are not the same
-                prob += proximity_dict.get((elem1, elem2), 0) # get proximity value from proximity dictionary
-      
-    memo[key] = prob # store calculated probability in memoization dictionary
-    return prob
-'''
- 
+# Print the transition matrix
+print("Transition Matrix:")
+print(transition_matrix.toarray())  # Convert sparse matrix to dense for printing
+
+# Print the state mapping
+print("\nState Mapping:")
+print(state_mapping)
+
+# Example of simulating a Markov process (commented out for brevity)
+# initial_vector = [1 if state == ('0101', '0103', '0104') else 0 for state in states]
+# simulate_markov_process(transition_matrix, initial_vector, max_additions=3, steps=10)
